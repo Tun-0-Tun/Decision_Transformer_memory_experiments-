@@ -15,13 +15,14 @@ import matplotlib.pyplot as plt
 
 
 class POMDPDataset(Dataset):
-    def __init__(self, data_dir, block_size):
+    def __init__(self, data_dir, block_size, max_trajectories=None):
         """
         Dataset for POMDP environments.
         
         Args:
             data_dir: Directory containing trajectory data
             block_size: Context length for the transformer
+            max_trajectories: If set, use only the first N trajectory files
         """
         self.block_size = block_size
         
@@ -30,6 +31,8 @@ class POMDPDataset(Dataset):
         
         files = glob.glob(os.path.join(data_dir, 'train_data_*.npz'))
         files.sort()
+        if max_trajectories is not None:
+            files = files[:max_trajectories]
         
         self.states = []
         self.actions = []
@@ -120,6 +123,7 @@ class MemoryDecisionTransformer(nn.Module):
         self.n_embed = n_embed
         self.context_length = context_length
         self.memory_type = memory_type
+        self.memory_dim = memory_dim
         
         # (R,o,a) encoders
         self.state_encoder = nn.Linear(state_dim, n_embed)
@@ -130,11 +134,22 @@ class MemoryDecisionTransformer(nn.Module):
         
         # Memory module (optional)
         if memory_type == 'gru':
-            # TODO: Implement GRU memory
+            self.memory = nn.GRU(n_embed, memory_dim, batch_first=True)
             self.memory_proj = nn.Linear(memory_dim, n_embed)
         elif memory_type == 'lstm':
-            # TODO: Implement LSTM memory
+            self.memory = nn.LSTM(n_embed, memory_dim, batch_first=True)
             self.memory_proj = nn.Linear(memory_dim, n_embed)
+        elif memory_type == 'ema':
+            # Multi-scale per-channel EMA memory.
+            self.memory = None
+            half_lives = torch.logspace(np.log10(1.5), np.log10(30.0), n_embed)
+            alpha_init = 0.5 ** (1.0 / half_lives)                 
+            self.decay = nn.Parameter(
+                torch.log(alpha_init / (1.0 - alpha_init))       
+            )
+            self.ema_init = nn.Parameter(torch.zeros(n_embed))       
+            self.memory_proj = nn.Linear(n_embed, n_embed)      
+            self.mem_gate = nn.Parameter(torch.zeros(1))   
         else:
             self.memory = None
         
@@ -156,6 +171,31 @@ class MemoryDecisionTransformer(nn.Module):
     def reset_memory(self):
         """Reset the memory state."""
         self.hidden_state = None
+
+    def _init_hidden(self, batch_size, device):
+        """Initialize RNN hidden state for a new sequence."""
+        if self.memory_type == 'gru':
+            return torch.zeros(1, batch_size, self.memory_dim, device=device)
+        # LSTM
+        h = torch.zeros(1, batch_size, self.memory_dim, device=device)
+        c = torch.zeros(1, batch_size, self.memory_dim, device=device)
+        return (h, c)
+
+
+    def _apply_ema_memory(self, state_embeddings):
+        """
+        Per-channel learnable EMA over the current context window.
+        """
+        B, T, D = state_embeddings.shape
+        alpha = torch.sigmoid(self.decay)                     
+        one_minus = 1.0 - alpha                           
+
+        ema = self.ema_init.unsqueeze(0).expand(B, D).contiguous() 
+        outputs = []
+        for t in range(T):
+            ema = alpha * ema + one_minus * state_embeddings[:, t]
+            outputs.append(ema)
+        return torch.stack(outputs, dim=1)                    
     
     def forward(self, states, actions, rtgs):
         """Forward pass."""
@@ -182,23 +222,16 @@ class MemoryDecisionTransformer(nn.Module):
         return_embeddings = self.return_encoder(rtgs)
         
         # add memory
-        if self.memory is not None:
-            if self.memory_type == 'gru':
-                if self.hidden_state is None:
-                    # TODO: Implement GRU memory
-                
-                memory_out, self.hidden_state = self.memory(state_embeddings, self.hidden_state)
-            elif self.memory_type == 'lstm':
-                if self.hidden_state is None:
-                    # TODO: Implement LSTM memory
-                
-                memory_out, self.hidden_state = self.memory(state_embeddings, self.hidden_state)
-            
-            # project memory to embedding dimension
-            memory_embedding = self.memory_proj(memory_out)
-            
-            # combine memory with state embeddings
-            state_embeddings = state_embeddings + memory_embedding
+        if self.memory_type in ('gru', 'lstm'):
+            if self.hidden_state is None:
+                self.hidden_state = self._init_hidden(batch_size, state_embeddings.device)
+            memory_out, self.hidden_state = self.memory(state_embeddings, self.hidden_state)
+            state_embeddings = state_embeddings + self.memory_proj(memory_out)
+        elif self.memory_type == 'ema':
+            memory_out = self._apply_ema_memory(state_embeddings)
+            delta = state_embeddings - memory_out
+            state_embeddings = state_embeddings + \
+                torch.tanh(self.mem_gate) * self.memory_proj(delta)
         
         # prepare sequence for transformer (R_t, o_t, a_t)
         sequence = torch.cat([
@@ -280,11 +313,14 @@ class MemoryDecisionTransformer(nn.Module):
 def train_memory_dt(
         env_name, dataset_path, n_epochs=10, batch_size=64, context_length=20,
         n_embed=128, n_layer=2, n_head=4, memory_type='gru', memory_dim=64,
-        learning_rate=1e-4, weight_decay=1e-4, debug=False
+        learning_rate=1e-4, weight_decay=1e-4, debug=False,
+        max_trajectories=None, experiment_tag=None, save_plots=True
     ):
     """Train a Memory-enabled Decision Transformer."""
     
-    dataset = POMDPDataset(dataset_path, block_size=context_length*3)
+    dataset = POMDPDataset(
+        dataset_path, block_size=context_length * 3, max_trajectories=max_trajectories
+    )
     
     # split into train/val
     train_size = int(0.9 * len(dataset))
@@ -545,35 +581,37 @@ def train_memory_dt(
     
     # save best model
     os.makedirs('models', exist_ok=True)
-    best_model_path = f"models/memory_dt_{env_name}_{memory_type}_best.pt"
+    mem_label = memory_type if memory_type is not None else 'none'
+    tag_suffix = f"_{experiment_tag}" if experiment_tag else ""
+    best_model_path = f"models/memory_dt_{env_name}_{mem_label}{tag_suffix}_best.pt"
     torch.save(best_model_state if best_model_state else model.state_dict(), best_model_path)
     print(f"Best model saved to {best_model_path}")
     
     if hasattr(val_env, 'close'):
         val_env.close()
     
-    # plot training curves
-    plt.figure(figsize=(12, 4))
+    if save_plots:
+        plt.figure(figsize=(12, 4))
+        
+        plt.subplot(1, 3, 1)
+        plt.plot(train_losses, label='Train')
+        plt.plot(val_losses, label='Validation')
+        plt.title('Loss Curves')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        
+        plt.subplot(1, 3, 2)
+        plt.plot(val_returns)
+        plt.title('Validation Returns')
+        plt.xlabel('Epoch')
+        plt.ylabel('Mean Return')
+        
+        plt.tight_layout()
+        plt.savefig(f"models/memory_dt_{env_name}_{mem_label}{tag_suffix}_training.png")
+        plt.close()
     
-    plt.subplot(1, 3, 1)
-    plt.plot(train_losses, label='Train')
-    plt.plot(val_losses, label='Validation')
-    plt.title('Loss Curves')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    
-    plt.subplot(1, 3, 2)
-    plt.plot(val_returns)
-    plt.title('Validation Returns')
-    plt.xlabel('Epoch')
-    plt.ylabel('Mean Return')
-    
-    plt.tight_layout()
-    plt.savefig(f"models/memory_dt_{env_name}_{memory_type}_training.png")
-    plt.close()
-    
-    return model, train_losses, val_returns
+    return model, train_losses, val_returns, best_model_path
 
 
 def evaluate_memory_dt(model, env, num_episodes=10, render=False, target_return=None, context_length=20, debug=False, return_success_rate=True):
@@ -882,7 +920,7 @@ if __name__ == "__main__":
     parser.add_argument('--env', type=str, default='velocity_cartpole', 
                       choices=['velocity_cartpole', 'flickering_pendulum', 'lidar_mountain_car'], 
                       help='Environment name')
-    parser.add_argument('--memory', type=str, default='gru', choices=['gru', 'lstm', 'none'], 
+    parser.add_argument('--memory', type=str, default='gru', choices=['gru', 'lstm', 'ema', 'none'], 
                       help='Memory type')
     parser.add_argument('--epochs', type=int, default=10, help='Number of epochs')
     

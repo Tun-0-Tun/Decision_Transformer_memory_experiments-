@@ -31,8 +31,8 @@ def parse_args():
     parser.add_argument('--n_head', type=int, default=4,
                         help='Number of attention heads')
     parser.add_argument('--memory_type', type=str, default='gru',
-                        choices=['gru', 'lstm', 'none'],
-                        help='Type of memory to use (gru, lstm, or none)')
+                        choices=['gru', 'lstm', 'ema', 'none'],
+                        help='Type of memory to use (gru, lstm, ema, or none)')
     parser.add_argument('--memory_dim', type=int, default=64,
                         help='Dimension of memory state')
     parser.add_argument('--learning_rate', type=float, default=1e-3,
@@ -107,7 +107,9 @@ def main():
     
     env = create_env(args.env)
     
-    if args.env == 'velocity_cartpole':
+    if args.target_return is not None:
+        target_return = args.target_return
+    elif args.env == 'velocity_cartpole':
         target_return = 500.0
     elif args.env == 'flickering_pendulum':
         target_return = -200.0  # the goal is to minimize loss in pendulum
@@ -122,7 +124,7 @@ def main():
         train_losses = []
     else:
         print(f"Training Memory Decision Transformer on {args.env}...")
-        model, train_losses, val_returns = train_memory_dt(
+        model, train_losses, val_returns, _ = train_memory_dt(
             env_name=args.env,
             dataset_path=dataset_path,
             n_epochs=args.n_epochs,
